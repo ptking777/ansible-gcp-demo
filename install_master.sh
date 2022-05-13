@@ -1,0 +1,230 @@
+#!/bin/sh
+
+# Source: http://kubernetes.io/docs/getting-started-guides/kubeadm
+# https://github.com/killer-sh/cks-course-environment/tree/master/cluster-setup/latest
+
+set -e
+
+KUBE_VERSION=1.23.4
+
+
+### setup terminal
+#apt-get update
+sudo apt update && sudo apt upgrade -y
+
+apt install -y build-essential vim
+
+apt-get install -y bash-completion binutils
+
+echo 'colorscheme desert' >> ~/.vimrc
+echo 'set tabstop=2' >> ~/.vimrc
+echo 'set shiftwidth=2' >> ~/.vimrc
+echo 'set expandtab' >> ~/.vimrc
+echo 'source <(kubectl completion bash)' >> ~/.bashrc
+echo 'alias k=kubectl' >> ~/.bashrc
+echo 'alias c=clear' >> ~/.bashrc
+echo 'complete -F __start_kubectl k' >> ~/.bashrc
+sed -i '1s/^/force_color_prompt=yes\n/' ~/.bashrc
+
+
+
+echo "alias wtf='--wait=false --force'" >> ~/.bashrc
+echo 'alias c=clear' >> ~/.bashrc
+echo "export drun='--dry-run=client -o yaml'" >> ~/.bashrc
+echo "export wtf='--wait=false --force'" >> ~/.bashrc
+
+
+### disable linux swap and remove any existing swap partitions
+swapoff -a
+sed -i '/\sswap\s/ s/^\(.*\)$/#\1/g' /etc/fstab
+
+
+### remove packages
+kubeadm reset -f || true
+crictl rm --force $(crictl ps -a -q) || true
+apt-mark unhold kubelet kubeadm kubectl kubernetes-cni || true
+apt-get remove -y docker.io containerd kubelet kubeadm kubectl kubernetes-cni || true
+apt-get autoremove -y
+systemctl daemon-reload
+
+apt-get install software-properties-common -y
+#add-apt-repository universe
+sudo apt-get update -y
+
+### install packages
+curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
+cat <<EOF > /etc/apt/sources.list.d/kubernetes.list
+deb http://apt.kubernetes.io/ kubernetes-xenial main
+EOF
+
+
+apt-get update -y
+apt-get install -y docker.io containerd kubelet=${KUBE_VERSION}-00 kubeadm=${KUBE_VERSION}-00 kubectl=${KUBE_VERSION}-00 kubernetes-cni
+apt-mark hold kubelet kubeadm kubectl kubernetes-cni
+
+## docker change cgroup driver to systemd
+#cat > /etc/docker/daemon.json <<EOF
+#{
+#  "exec-opts": ["native.cgroupdriver=systemd"]
+#}
+#EOF
+
+## docker change cgroup driver to systemd
+[ -d /etc/docker ] || mkdir /etc/docker
+cat <<EOF | sudo tee /etc/docker/daemon.json
+{ "exec-opts": ["native.cgroupdriver=systemd"],
+"log-driver": "json-file",
+"log-opts":
+{ "max-size": "100m" },
+"storage-driver": "overlay2"
+}
+EOF
+
+
+systemctl daemon-reload
+systemctl restart docker
+systemctl enable docker
+
+
+### containerd
+cat <<EOF | sudo tee /etc/modules-load.d/containerd.conf
+overlay
+br_netfilter
+EOF
+
+sudo modprobe overlay
+sudo modprobe br_netfilter
+
+cat <<EOF | sudo tee /etc/sysctl.d/99-kubernetes-cri.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.ipv4.ip_forward                 = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+EOF
+
+sysctl --system
+[ -d /etc/containerd ] || mkdir -p /etc/containerd
+
+
+### containerd config
+cat > /etc/containerd/config.toml <<EOF
+disabled_plugins = []
+imports = []
+oom_score = 0
+plugin_dir = ""
+required_plugins = []
+root = "/var/lib/containerd"
+state = "/run/containerd"
+version = 2
+
+[plugins]
+
+  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes]
+    [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+      base_runtime_spec = ""
+      container_annotations = []
+      pod_annotations = []
+      privileged_without_host_devices = false
+      runtime_engine = ""
+      runtime_root = ""
+      runtime_type = "io.containerd.runc.v2"
+
+      [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+        BinaryName = ""
+        CriuImagePath = ""
+        CriuPath = ""
+        CriuWorkPath = ""
+        IoGid = 0
+        IoUid = 0
+        NoNewKeyring = false
+        NoPivotRoot = false
+        Root = ""
+        ShimCgroup = ""
+        SystemdCgroup = true
+EOF
+
+
+### crictl uses containerd as default
+{
+cat <<EOF | sudo tee /etc/crictl.yaml
+runtime-endpoint: unix:///run/containerd/containerd.sock
+EOF
+}
+
+
+### kubelet should use containerd
+{
+cat <<EOF | sudo tee /etc/default/kubelet
+KUBELET_EXTRA_ARGS="--container-runtime remote --container-runtime-endpoint unix:///run/containerd/containerd.sock"
+EOF
+}
+
+
+if [ 1 -eq 2 ];then
+### install podman
+#apt-get install software-properties-common -y
+#add-apt-repository -y ppa:projectatomic/ppa
+
+# deb http://us.archive.ubuntu.com/ubuntu/ bionic main
+
+
+. /etc/os-release
+sh -c "echo 'deb http://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/xUbuntu_${VERSION_ID}/ /' > /etc/apt/sources.list.d/devel:kubic:libcontainers:stable.list"
+
+
+
+wget -nv https://download.opensuse.org/repositories/devel:kubic:libcontainers:stable/xUbuntu_${VERSION_ID}/Release.key -O- | apt-key add -
+
+apt-get update -qq -y
+apt-get install -y podman  containers-common
+
+
+[ -d /etc/containers ] || mkdir /etc/containers/
+
+cat <<EOF > /etc/containers/registries.conf
+[registries.search]
+registries = ['docker.io']
+EOF
+
+fi
+
+
+### start services
+systemctl daemon-reload
+systemctl enable containerd
+systemctl restart containerd
+systemctl enable kubelet && systemctl start kubelet
+
+
+### init k8s
+rm /root/.kube/config || true
+kubeadm init --kubernetes-version=${KUBE_VERSION} --ignore-preflight-errors=NumCPU --skip-token-print
+
+[ -d ~/.kube ] || mkdir -p ~/.kube
+sudo cp -i /etc/kubernetes/admin.conf ~/.kube/config
+
+# workaround because https://github.com/weaveworks/weave/issues/3927
+# kubectl apply -f "https://cloud.weave.works/k8s/net?k8s-version=$(kubectl version | base64 | tr -d '\n')"
+curl -L https://cloud.weave.works/k8s/net?k8s-version=$(kubectl version | base64 | tr -d '\n') -o weave.yaml
+sed -i 's/ghcr.io\/weaveworks\/launcher/docker.io\/weaveworks/g' weave.yaml
+kubectl -f weave.yaml apply
+rm weave.yaml
+
+apt-mark unhold kubelet kubeadm kubectl kubernetes-cni
+
+
+
+#systemctl daemon-reload
+#systemctl restart docker
+
+
+# etcdctl
+ETCDCTL_VERSION=v3.5.1
+ETCDCTL_VERSION_FULL=etcd-${ETCDCTL_VERSION}-linux-amd64
+wget https://github.com/etcd-io/etcd/releases/download/${ETCDCTL_VERSION}/${ETCDCTL_VERSION_FULL}.tar.gz
+tar xzf ${ETCDCTL_VERSION_FULL}.tar.gz
+mv ${ETCDCTL_VERSION_FULL}/etcdctl /usr/bin/
+rm -rf ${ETCDCTL_VERSION_FULL} ${ETCDCTL_VERSION_FULL}.tar.gz
+
+echo
+echo "### COMMAND TO ADD A WORKER NODE ###"
+kubeadm token create --print-join-command --ttl 0
